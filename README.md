@@ -67,8 +67,12 @@ the distro's PyGObject.
 
 ## USB (Auto tab)
 
-See frija-cli's README. In short: be in the `dialout` group, and stop ModemManager
-(`sudo systemctl stop ModemManager`) if the phone isn't detected.
+The app opens on the Auto tab and reads the phone as soon as it's plugged in. Your user
+needs to be in the `dialout` group.
+
+If ModemManager (the mobile broadband service) is holding the phone's port, the Auto tab
+shows a **Stop ModemManager** button. It asks for your password and stops the service
+until the next reboot. No terminal needed.
 
 ## Credits
 

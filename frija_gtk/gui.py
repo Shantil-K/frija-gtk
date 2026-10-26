@@ -7,6 +7,9 @@ work is done by the `frija` package from frija-cli.
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 
@@ -31,7 +34,6 @@ DEFAULTS = {
     "legacy_model": "", "legacy_csc": "", "legacy_pda": "", "legacy_cscver": "", "legacy_phone": "",
     "output_dir": GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~"),
     "check_crc": True, "decrypt": True, "keep_encrypted": False, "factory": False,
-    "mode": "manual",
 }
 
 
@@ -52,6 +54,28 @@ def save_settings(s):
             json.dump(s, f, indent=2)
     except OSError as e:
         log.warning("Could not save settings: %s", e)
+
+
+def modemmanager_running():
+    if not sys.platform.startswith("linux") or not shutil.which("systemctl"):
+        return False
+    r = subprocess.run(["systemctl", "is-active", "--quiet", "ModemManager"], check=False)
+    return r.returncode == 0
+
+
+def stop_modemmanager():
+    """Stop ModemManager with a graphical password prompt. Returns an error message or None."""
+    cmd = ["systemctl", "stop", "ModemManager"]
+    if shutil.which("pkexec"):
+        cmd = ["pkexec"] + cmd  # polkit shows the desktop's password dialog
+    r = subprocess.run(cmd, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode in (126, 127) and cmd[0] == "pkexec":
+        return "Authentication was cancelled or failed."
+    if r.returncode != 0:
+        return (r.stderr or r.stdout).strip() or f"systemctl exited with code {r.returncode}"
+    if modemmanager_running():
+        return "ModemManager is still running."
+    return None
 
 
 def human_gb(n):
@@ -117,6 +141,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
 
         self.connect("delete-event", self.on_close)
         GLib.timeout_add_seconds(2, self.poll_devices)
+        GLib.idle_add(lambda: self.poll_devices() and False)  # check for a phone right away
         log.info("Frija GTK %s (frija-cli %s) ready", __version__, CORE_VERSION)
 
     # ------------------------------------------------------------ layout
@@ -250,6 +275,18 @@ class FrijaWindow(Gtk.ApplicationWindow):
             ("Model", self.dev["model"]), ("CSC", self.dev["csc"]),
             ("Serial", self.dev["serial"]), ("Firmware", self.dev["firmware"]),
         ]), False, False, 0)
+
+        # Shown when ModemManager is holding the phone's port
+        self.mm_bar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, show_close_button=False)
+        self.mm_bar.get_content_area().add(Gtk.Label(
+            label="ModemManager (the system's mobile broadband service) is using the phone's port, "
+                  "so Frija can't read it. Stop it until the next reboot?",
+            xalign=0, wrap=True))
+        self.mm_btn = Gtk.Button(label="Stop ModemManager")
+        self.mm_btn.get_style_context().add_class("suggested-action")
+        self.mm_btn.connect("clicked", self.on_stop_modemmanager)
+        self.mm_bar.get_action_area().add(self.mm_btn)
+        box.pack_start(self.mm_bar, False, False, 0)
         return box
 
     def _page_manual(self):
@@ -288,7 +325,8 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.opt_keep.set_active(s["keep_encrypted"]); self.opt_keep.set_sensitive(s["decrypt"])
         self.opt_factory.set_active(s["factory"])
         self.show_all()
-        self.stack.set_visible_child_name(s["mode"] if s["mode"] in ("auto", "manual", "legacy") else "manual")
+        self.mm_bar.hide()
+        self.stack.set_visible_child_name("auto")  # always start on the Auto tab
 
     def _collect_settings(self):
         self.settings.update(
@@ -299,7 +337,6 @@ class FrijaWindow(Gtk.ApplicationWindow):
             output_dir=self.folder_btn.get_filename() or self.settings["output_dir"],
             check_crc=self.opt_crc.get_active(), decrypt=self.opt_decrypt.get_active(),
             keep_encrypted=self.opt_keep.get_active(), factory=self.opt_factory.get_active(),
-            mode=self.stack.get_visible_child_name(),
         )
 
     def on_close(self, *_):
@@ -409,15 +446,41 @@ class FrijaWindow(Gtk.ApplicationWindow):
             if exc:
                 self.device = None
                 self._failed_port = port  # don't retry until replugged or Rescan
-                self._show_device(None, str(exc), title="Could not read device")
-                log.error("%s: %s", port, exc)
+                msg = str(exc)
+                self.mm_bar.hide()
+                if "did not return" in msg:
+                    if modemmanager_running():
+                        msg = "The phone didn't answer because ModemManager is using its port."
+                        self.mm_bar.show_all()
+                    else:
+                        msg = "The phone didn't answer. Unlock it, then press Rescan."
+                self._show_device(None, msg, title="Could not read device")
+                log.error("%s: %s", port, msg)
             else:
+                self.mm_bar.hide()
                 self._failed_port = None
                 self.device = dev
                 self._show_device(dev)
                 log.info("Device connected on %s: %s / %s", port, dev.model, dev.csc)
             return False
         self.run_bg(lambda: modem.read_device_info(port), done)
+
+    def on_stop_modemmanager(self, *_):
+        self.mm_btn.set_sensitive(False)
+        log.info("Stopping ModemManager (you may be asked for your password)…")
+
+        def done(err, exc):
+            self.mm_btn.set_sensitive(True)
+            err = err or (str(exc) if exc else None)
+            if err:
+                log.error("Could not stop ModemManager: %s", err)
+                self.error("Could not stop ModemManager", err)
+                return False
+            log.info("ModemManager stopped. Reading the phone again…")
+            self.mm_bar.hide()
+            GLib.timeout_add(1000, lambda: self.probe_device(force=True) and False)
+            return False
+        self.run_bg(stop_modemmanager, done)
 
     def _show_device(self, dev, sub="", title="No device connected"):
         if dev:
