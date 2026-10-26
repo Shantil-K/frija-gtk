@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frija-gtk"
+version = "2.0.26142.10"
+description = "GTK 3 front end for frija-cli, the Samsung firmware downloader"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+readme = "README.md"
+# PyGObject (GTK bindings) is deliberately not listed: building it with pip needs
+# C headers. Install it from your distro instead (python3-gi, gir1.2-gtk-3.0).
+dependencies = ["frija-cli @ git+https://github.com/Shantil-K/frija-cli.git"]
+
+[project.urls]
+Homepage = "https://github.com/Shantil-K/frija-gtk"
+Issues = "https://github.com/Shantil-K/frija-gtk/issues"
+
+[project.gui-scripts]
+frija-gtk = "frija_gtk.gui:main"

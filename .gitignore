@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+# downloaded firmware
+*.enc2
+*.enc4
+*.zip
