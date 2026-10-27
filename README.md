@@ -10,7 +10,7 @@ It has the same **Auto / Manual / Legacy** tabs as the original Windows Frija:
 - **Manual**: enter the model, CSC and IMEI or serial number.
 - **Legacy**: enter the model, CSC and a specific firmware version.
 
-Use the ☰ menu for settings (CRC check, decrypt, keep encrypted file, factory firmware). **Stop** pauses a download, and **Download** resumes it. Fields and
+Use the ☰ menu for settings (CRC check, decrypt, keep encrypted file, factory firmware). **Pause** pauses a download and **Download** resumes it. **Stop** cancels it and deletes the partial file. Fields and
 settings are saved to `~/.config/frija/settings.json`.
 
 This front end is aimed at Linux desktops. On Windows, use frija-cli directly. GTK does
