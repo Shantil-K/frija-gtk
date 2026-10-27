@@ -7,9 +7,6 @@ work is done by the `frija` package from frija-cli.
 import json
 import logging
 import os
-import shutil
-import subprocess
-import sys
 import threading
 import time
 
@@ -34,6 +31,7 @@ DEFAULTS = {
     "legacy_model": "", "legacy_csc": "", "legacy_pda": "", "legacy_cscver": "", "legacy_phone": "",
     "output_dir": GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~"),
     "check_crc": True, "decrypt": True, "keep_encrypted": False, "factory": False,
+    "mode": "manual",
 }
 
 
@@ -54,28 +52,6 @@ def save_settings(s):
             json.dump(s, f, indent=2)
     except OSError as e:
         log.warning("Could not save settings: %s", e)
-
-
-def modemmanager_running():
-    if not sys.platform.startswith("linux") or not shutil.which("systemctl"):
-        return False
-    r = subprocess.run(["systemctl", "is-active", "--quiet", "ModemManager"], check=False)
-    return r.returncode == 0
-
-
-def stop_modemmanager():
-    """Stop ModemManager with a graphical password prompt. Returns an error message or None."""
-    cmd = ["systemctl", "stop", "ModemManager"]
-    if shutil.which("pkexec"):
-        cmd = ["pkexec"] + cmd  # polkit shows the desktop's password dialog
-    r = subprocess.run(cmd, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    if r.returncode in (126, 127) and cmd[0] == "pkexec":
-        return "Authentication was cancelled or failed."
-    if r.returncode != 0:
-        return (r.stderr or r.stdout).strip() or f"systemctl exited with code {r.returncode}"
-    if modemmanager_running():
-        return "ModemManager is still running."
-    return None
 
 
 def human_gb(n):
@@ -127,8 +103,6 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.device = None
         self.busy = False
         self.cancel_event = threading.Event()
-        self._stopping = False   # True: Stop (delete the file); False: Pause (keep it)
-        self._paused_dest = None  # partial file left by Pause, so Stop can still discard it
         self._last_ui = 0.0
         self._probing_port = None
         self._failed_port = None
@@ -143,7 +117,6 @@ class FrijaWindow(Gtk.ApplicationWindow):
 
         self.connect("delete-event", self.on_close)
         GLib.timeout_add_seconds(2, self.poll_devices)
-        GLib.idle_add(lambda: self.poll_devices() and False)  # check for a phone right away
         log.info("Frija GTK %s (frija-cli %s) ready", __version__, CORE_VERSION)
 
     # ------------------------------------------------------------ layout
@@ -222,11 +195,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.download_btn.set_sensitive(False)
         self.download_btn.connect("clicked", self.on_download)
         row.pack_start(self.download_btn, False, False, 0)
-        self.pause_btn = Gtk.Button(label="Pause", tooltip_text="Pause the download. Press Download to resume.")
-        self.pause_btn.set_sensitive(False)
-        self.pause_btn.connect("clicked", self.on_pause)
-        row.pack_start(self.pause_btn, False, False, 0)
-        self.stop_btn = Gtk.Button(label="Stop", tooltip_text="Cancel the download and delete the partial file.")
+        self.stop_btn = Gtk.Button(label="Stop")
         self.stop_btn.get_style_context().add_class("destructive-action")
         self.stop_btn.set_sensitive(False)
         self.stop_btn.connect("clicked", self.on_stop)
@@ -281,18 +250,6 @@ class FrijaWindow(Gtk.ApplicationWindow):
             ("Model", self.dev["model"]), ("CSC", self.dev["csc"]),
             ("Serial", self.dev["serial"]), ("Firmware", self.dev["firmware"]),
         ]), False, False, 0)
-
-        # Shown when ModemManager is holding the phone's port
-        self.mm_bar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, show_close_button=False)
-        self.mm_bar.get_content_area().add(Gtk.Label(
-            label="ModemManager (the system's mobile broadband service) is using the phone's port, "
-                  "so Frija can't read it. Stop it until the next reboot?",
-            xalign=0, wrap=True))
-        self.mm_btn = Gtk.Button(label="Stop ModemManager")
-        self.mm_btn.get_style_context().add_class("suggested-action")
-        self.mm_btn.connect("clicked", self.on_stop_modemmanager)
-        self.mm_bar.get_action_area().add(self.mm_btn)
-        box.pack_start(self.mm_bar, False, False, 0)
         return box
 
     def _page_manual(self):
@@ -331,8 +288,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.opt_keep.set_active(s["keep_encrypted"]); self.opt_keep.set_sensitive(s["decrypt"])
         self.opt_factory.set_active(s["factory"])
         self.show_all()
-        self.mm_bar.hide()
-        self.stack.set_visible_child_name("auto")  # always start on the Auto tab
+        self.stack.set_visible_child_name(s["mode"] if s["mode"] in ("auto", "manual", "legacy") else "manual")
 
     def _collect_settings(self):
         self.settings.update(
@@ -343,11 +299,12 @@ class FrijaWindow(Gtk.ApplicationWindow):
             output_dir=self.folder_btn.get_filename() or self.settings["output_dir"],
             check_crc=self.opt_crc.get_active(), decrypt=self.opt_decrypt.get_active(),
             keep_encrypted=self.opt_keep.get_active(), factory=self.opt_factory.get_active(),
+            mode=self.stack.get_visible_child_name(),
         )
 
     def on_close(self, *_):
         if self.busy:
-            if not self.confirm("A download is running", "Pause it and quit? You can resume it later."):
+            if not self.confirm("A download is running", "Stop it and quit? You can resume it later."):
                 return True
             self.cancel_event.set()
         self._collect_settings()
@@ -371,8 +328,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.check_btn.set_sensitive(not busy)
         self.folder_btn.set_sensitive(not busy)
         self.download_btn.set_sensitive(not busy and self.fw is not None)
-        self.pause_btn.set_sensitive(busy)
-        self.stop_btn.set_sensitive(busy or self._paused_dest is not None)
+        self.stop_btn.set_sensitive(busy)
         (self.spinner.start if busy else self.spinner.stop)()
         if status is not None:
             self.status.set_text(status)
@@ -453,41 +409,15 @@ class FrijaWindow(Gtk.ApplicationWindow):
             if exc:
                 self.device = None
                 self._failed_port = port  # don't retry until replugged or Rescan
-                msg = str(exc)
-                self.mm_bar.hide()
-                if "did not return" in msg:
-                    if modemmanager_running():
-                        msg = "The phone didn't answer because ModemManager is using its port."
-                        self.mm_bar.show_all()
-                    else:
-                        msg = "The phone didn't answer. Unlock it, then press Rescan."
-                self._show_device(None, msg, title="Could not read device")
-                log.error("%s: %s", port, msg)
+                self._show_device(None, str(exc), title="Could not read device")
+                log.error("%s: %s", port, exc)
             else:
-                self.mm_bar.hide()
                 self._failed_port = None
                 self.device = dev
                 self._show_device(dev)
                 log.info("Device connected on %s: %s / %s", port, dev.model, dev.csc)
             return False
         self.run_bg(lambda: modem.read_device_info(port), done)
-
-    def on_stop_modemmanager(self, *_):
-        self.mm_btn.set_sensitive(False)
-        log.info("Stopping ModemManager (you may be asked for your password)…")
-
-        def done(err, exc):
-            self.mm_btn.set_sensitive(True)
-            err = err or (str(exc) if exc else None)
-            if err:
-                log.error("Could not stop ModemManager: %s", err)
-                self.error("Could not stop ModemManager", err)
-                return False
-            log.info("ModemManager stopped. Reading the phone again…")
-            self.mm_bar.hide()
-            GLib.timeout_add(1000, lambda: self.probe_device(force=True) and False)
-            return False
-        self.run_bg(stop_modemmanager, done)
 
     def _show_device(self, dev, sub="", title="No device connected"):
         if dev:
@@ -520,7 +450,6 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self._collect_settings()
         save_settings(self.settings)
         self.fw = None
-        self._paused_dest = None  # a paused file stays on disk; Download offers to resume it
         self._show_fw(None)
         self.set_busy(True, "Checking for firmware…")
         self.progress.set_fraction(0); self.progress.set_text(""); self.speed.set_text("")
@@ -581,8 +510,6 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self._collect_settings()
         save_settings(self.settings)
         self.cancel_event.clear()
-        self._stopping = False
-        self._paused_dest = None
         self.set_busy(True, "Downloading…")
         fw, client = self.fw, self.client
         check_crc, do_decrypt, keep = self.opt_crc.get_active(), self.opt_decrypt.get_active(), self.opt_keep.get_active()
@@ -603,19 +530,12 @@ class FrijaWindow(Gtk.ApplicationWindow):
             return core.decrypt(dest, core.decrypt_key_for(fw, dest), keep, self.progress_cb("Decrypted"), cancel)
 
         def done(path, exc):
-            self.speed.set_text("")
-            if isinstance(exc, core.Cancelled) and self._stopping:
-                self._discard(dest)
-                self.set_busy(False, "Stopped")
-                log.info("Download stopped and partial file deleted")
-                return False
-            if isinstance(exc, core.Cancelled):
-                self._paused_dest = dest if os.path.exists(dest) else None
-                self.set_busy(False, "Paused. Press Download to resume.")
-                log.info("Download paused")
-                return False
             self.set_busy(False)
-            if exc:
+            self.speed.set_text("")
+            if isinstance(exc, core.Cancelled):
+                self.status.set_text("Stopped. Press Download again to resume.")
+                log.info("Download paused or stopped")
+            elif exc:
                 msg = f"Network error: {exc}" if isinstance(exc, requests.RequestException) else str(exc)
                 self.status.set_text("Failed")
                 log.error(msg)
@@ -638,37 +558,10 @@ class FrijaWindow(Gtk.ApplicationWindow):
         r = d.run(); d.destroy()
         return {1: "overwrite", 2: "resume"}.get(r, "cancel")
 
-    def on_pause(self, *_):
-        self._stopping = False
-        self.cancel_event.set()
-        self.status.set_text("Pausing…")
-        self.pause_btn.set_sensitive(False)
-
     def on_stop(self, *_):
-        if not self.confirm("Stop the download?",
-                            "The partly downloaded file will be deleted. To continue later, use Pause instead."):
-            return
-        if self.busy:
-            self._stopping = True
-            self.cancel_event.set()
-            self.status.set_text("Stopping…")
-            self.pause_btn.set_sensitive(False)
-            self.stop_btn.set_sensitive(False)
-        elif self._paused_dest:
-            self._discard(self._paused_dest)
-            self.set_busy(False, "Stopped")
-            log.info("Paused download deleted")
-
-    def _discard(self, path):
-        self._paused_dest = None
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log.warning("Could not delete %s: %s", path, e)
-        self.progress.set_fraction(0)
-        self.progress.set_text("")
+        self.cancel_event.set()
+        self.status.set_text("Stopping…")
+        self.stop_btn.set_sensitive(False)
 
     def finished(self, path, decrypted):
         what = "downloaded and decrypted" if decrypted else "downloaded"

@@ -10,7 +10,7 @@ It has the same **Auto / Manual / Legacy** tabs as the original Windows Frija:
 - **Manual**: enter the model, CSC and IMEI or serial number.
 - **Legacy**: enter the model, CSC and a specific firmware version.
 
-Use the ☰ menu for settings (CRC check, decrypt, keep encrypted file, factory firmware). **Pause** pauses a download and **Download** resumes it. **Stop** cancels it and deletes the partial file. Fields and
+Use the ☰ menu for settings (CRC check, decrypt, keep encrypted file, factory firmware). **Stop** pauses a download, and **Download** resumes it. Fields and
 settings are saved to `~/.config/frija/settings.json`.
 
 This front end is aimed at Linux desktops. On Windows, use frija-cli directly. GTK does
@@ -67,12 +67,8 @@ the distro's PyGObject.
 
 ## USB (Auto tab)
 
-The app opens on the Auto tab and reads the phone as soon as it's plugged in. Your user
-needs to be in the `dialout` group.
-
-If ModemManager (the mobile broadband service) is holding the phone's port, the Auto tab
-shows a **Stop ModemManager** button. It asks for your password and stops the service
-until the next reboot. No terminal needed.
+See frija-cli's README. In short: be in the `dialout` group, and stop ModemManager
+(`sudo systemctl stop ModemManager`) if the phone isn't detected.
 
 ## Credits
 
