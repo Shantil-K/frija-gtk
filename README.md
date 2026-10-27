@@ -4,6 +4,8 @@ A GTK 3 window for **[frija-cli](https://github.com/Shantil-K/frija-cli)**, the 
 the interface. Looking up, downloading, verifying and decrypting firmware is all done
 by the `frija` package from frija-cli.
 
+![Frija GTK reading a phone in Auto mode](docs/screenshot.png)
+
 It has the same **Auto / Manual / Legacy** tabs as the original Windows Frija:
 
 - **Auto**: detects a Samsung phone plugged in over USB and reads its model, CSC and serial.
