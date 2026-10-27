@@ -4,9 +4,13 @@ Same layout ideas as the original: Auto / Manual / Legacy tabs, a firmware
 info panel, a download button with progress, and a log view. All the actual
 work is done by the `frija` package from frija-cli.
 """
+import errno
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 
@@ -52,6 +56,43 @@ def save_settings(s):
             json.dump(s, f, indent=2)
     except OSError as e:
         log.warning("Could not save settings: %s", e)
+
+
+def modemmanager_running():
+    """Ask systemd, not ModemManager itself: a D-Bus query would start it."""
+    if not sys.platform.startswith("linux") or not shutil.which("systemctl"):
+        return False
+    return subprocess.run(["systemctl", "is-active", "--quiet", "ModemManager"], check=False).returncode == 0
+
+
+def held_by_modemmanager(port, checks=4):
+    """True if ModemManager has the phone's port open right now.
+
+    ModemManager locks every port it opens (TIOCEXCL), so while it holds the
+    port, opening it as a normal user fails with "Device busy".
+    """
+    if not sys.platform.startswith("linux") or not modemmanager_running():
+        return False
+    for _ in range(checks):
+        try:
+            os.close(os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK))
+        except OSError as e:
+            return e.errno == errno.EBUSY
+        time.sleep(0.5)
+    return False
+
+
+def stop_modemmanager():
+    """Stop ModemManager. pkexec shows the desktop's password window. Returns an error or None."""
+    cmd = ["systemctl", "stop", "ModemManager"]
+    if shutil.which("pkexec"):
+        cmd = ["pkexec"] + cmd
+    r = subprocess.run(cmd, check=False, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode in (126, 127) and cmd[0] == "pkexec":
+        return "the password prompt was cancelled"
+    if r.returncode != 0:
+        return (r.stderr or r.stdout).strip() or f"systemctl exited with code {r.returncode}"
+    return None
 
 
 def human_gb(n):
@@ -108,6 +149,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self._last_ui = 0.0
         self._probing_port = None
         self._failed_port = None
+        self._mm_stopped_for = None  # port we already stopped ModemManager for (once per plug-in)
 
         self._build_header()
         self._build_body()
@@ -247,7 +289,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         tb.pack_start(self.dev_sub, False, False, 0)
         top.pack_start(tb, True, True, 0)
         self.rescan_btn = Gtk.Button(label="Rescan")
-        self.rescan_btn.connect("clicked", lambda *_: self.probe_device(force=True))
+        self.rescan_btn.connect("clicked", self.on_rescan)
         top.pack_end(self.rescan_btn, False, False, 0)
         box.pack_start(top, False, False, 0)
 
@@ -400,6 +442,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         ports = modem.find_ports()
         if not ports:
             self._failed_port = None
+            self._mm_stopped_for = None  # unplugged: reset for the next phone
             if self.device or force:
                 self.device = None
                 self._show_device(None, "Connect a Samsung phone over USB (unlocked, MTP mode)")
@@ -411,20 +454,60 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.dev_title.set_markup("<b>Reading device…</b>")
         self.dev_sub.set_text(port)
 
+        def work():
+            try:
+                return modem.read_device_info(port)
+            except Exception as e:  # noqa: BLE001 - shown to the user
+                e.held_by_mm = held_by_modemmanager(port)  # check right away, while it still holds it
+                raise
+
         def done(dev, exc):
             self._probing_port = None
-            if exc:
+            if exc and exc.held_by_mm and port != self._mm_stopped_for:
+                self._mm_stopped_for = port  # only once per plug-in, so a cancelled prompt doesn't repeat
+                self.auto_stop_modemmanager(port)
+            elif exc:
                 self.device = None
                 self._failed_port = port  # don't retry until replugged or Rescan
-                self._show_device(None, str(exc), title="Could not read device")
-                log.error("%s: %s", port, exc)
+                if exc.held_by_mm:
+                    msg = "ModemManager is using the phone's port and couldn't be stopped. Press Rescan to try again."
+                elif "did not return" in str(exc):
+                    msg = "The phone didn't answer. Unlock it and keep the screen on, then press Rescan."
+                else:
+                    msg = str(exc)
+                self._show_device(None, msg, title="Could not read device")
+                log.error("%s: %s", port, msg)
             else:
                 self._failed_port = None
                 self.device = dev
                 self._show_device(dev)
                 log.info("Device connected on %s: %s / %s", port, dev.model, dev.csc)
             return False
-        self.run_bg(lambda: modem.read_device_info(port), done)
+        self.run_bg(work, done)
+
+    def on_rescan(self, *_):
+        self._mm_stopped_for = None  # allow another automatic ModemManager stop
+        self.probe_device(force=True)
+
+    def auto_stop_modemmanager(self, port):
+        self._probing_port = port  # keep the poller away while we stop it
+        self._show_device(None, "ModemManager is holding the phone's port. Stopping it "
+                                "(your system may ask for your password)…", title="Freeing the USB port")
+        log.info("%s: ModemManager is holding the port, stopping it", port)
+
+        def done(err, exc):
+            self._probing_port = None
+            err = err or (str(exc) if exc else None)
+            if err:
+                self._failed_port = port
+                log.error("Could not stop ModemManager: %s", err)
+                self._show_device(None, "ModemManager is using the phone's port and couldn't be stopped "
+                                        f"({err}). Press Rescan to try again.", title="Could not read device")
+                return False
+            log.info("ModemManager stopped. Reading the phone again…")
+            GLib.timeout_add(1000, lambda: self.probe_device(force=True) and False)
+            return False
+        self.run_bg(stop_modemmanager, done)
 
     def _show_device(self, dev, sub="", title="No device connected"):
         if dev:
