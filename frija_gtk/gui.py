@@ -127,6 +127,8 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.device = None
         self.busy = False
         self.cancel_event = threading.Event()
+        self._stopping = False   # True: Stop (delete the file); False: Pause (keep it)
+        self._paused_dest = None  # partial file left by Pause, so Stop can still discard it
         self._last_ui = 0.0
         self._probing_port = None
         self._failed_port = None
@@ -220,7 +222,11 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.download_btn.set_sensitive(False)
         self.download_btn.connect("clicked", self.on_download)
         row.pack_start(self.download_btn, False, False, 0)
-        self.stop_btn = Gtk.Button(label="Stop")
+        self.pause_btn = Gtk.Button(label="Pause", tooltip_text="Pause the download. Press Download to resume.")
+        self.pause_btn.set_sensitive(False)
+        self.pause_btn.connect("clicked", self.on_pause)
+        row.pack_start(self.pause_btn, False, False, 0)
+        self.stop_btn = Gtk.Button(label="Stop", tooltip_text="Cancel the download and delete the partial file.")
         self.stop_btn.get_style_context().add_class("destructive-action")
         self.stop_btn.set_sensitive(False)
         self.stop_btn.connect("clicked", self.on_stop)
@@ -341,7 +347,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
 
     def on_close(self, *_):
         if self.busy:
-            if not self.confirm("A download is running", "Stop it and quit? You can resume it later."):
+            if not self.confirm("A download is running", "Pause it and quit? You can resume it later."):
                 return True
             self.cancel_event.set()
         self._collect_settings()
@@ -365,7 +371,8 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self.check_btn.set_sensitive(not busy)
         self.folder_btn.set_sensitive(not busy)
         self.download_btn.set_sensitive(not busy and self.fw is not None)
-        self.stop_btn.set_sensitive(busy)
+        self.pause_btn.set_sensitive(busy)
+        self.stop_btn.set_sensitive(busy or self._paused_dest is not None)
         (self.spinner.start if busy else self.spinner.stop)()
         if status is not None:
             self.status.set_text(status)
@@ -513,6 +520,7 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self._collect_settings()
         save_settings(self.settings)
         self.fw = None
+        self._paused_dest = None  # a paused file stays on disk; Download offers to resume it
         self._show_fw(None)
         self.set_busy(True, "Checking for firmware…")
         self.progress.set_fraction(0); self.progress.set_text(""); self.speed.set_text("")
@@ -573,6 +581,8 @@ class FrijaWindow(Gtk.ApplicationWindow):
         self._collect_settings()
         save_settings(self.settings)
         self.cancel_event.clear()
+        self._stopping = False
+        self._paused_dest = None
         self.set_busy(True, "Downloading…")
         fw, client = self.fw, self.client
         check_crc, do_decrypt, keep = self.opt_crc.get_active(), self.opt_decrypt.get_active(), self.opt_keep.get_active()
@@ -593,12 +603,19 @@ class FrijaWindow(Gtk.ApplicationWindow):
             return core.decrypt(dest, core.decrypt_key_for(fw, dest), keep, self.progress_cb("Decrypted"), cancel)
 
         def done(path, exc):
-            self.set_busy(False)
             self.speed.set_text("")
+            if isinstance(exc, core.Cancelled) and self._stopping:
+                self._discard(dest)
+                self.set_busy(False, "Stopped")
+                log.info("Download stopped and partial file deleted")
+                return False
             if isinstance(exc, core.Cancelled):
-                self.status.set_text("Stopped. Press Download again to resume.")
-                log.info("Download paused or stopped")
-            elif exc:
+                self._paused_dest = dest if os.path.exists(dest) else None
+                self.set_busy(False, "Paused. Press Download to resume.")
+                log.info("Download paused")
+                return False
+            self.set_busy(False)
+            if exc:
                 msg = f"Network error: {exc}" if isinstance(exc, requests.RequestException) else str(exc)
                 self.status.set_text("Failed")
                 log.error(msg)
@@ -621,10 +638,37 @@ class FrijaWindow(Gtk.ApplicationWindow):
         r = d.run(); d.destroy()
         return {1: "overwrite", 2: "resume"}.get(r, "cancel")
 
-    def on_stop(self, *_):
+    def on_pause(self, *_):
+        self._stopping = False
         self.cancel_event.set()
-        self.status.set_text("Stopping…")
-        self.stop_btn.set_sensitive(False)
+        self.status.set_text("Pausing…")
+        self.pause_btn.set_sensitive(False)
+
+    def on_stop(self, *_):
+        if not self.confirm("Stop the download?",
+                            "The partly downloaded file will be deleted. To continue later, use Pause instead."):
+            return
+        if self.busy:
+            self._stopping = True
+            self.cancel_event.set()
+            self.status.set_text("Stopping…")
+            self.pause_btn.set_sensitive(False)
+            self.stop_btn.set_sensitive(False)
+        elif self._paused_dest:
+            self._discard(self._paused_dest)
+            self.set_busy(False, "Stopped")
+            log.info("Paused download deleted")
+
+    def _discard(self, path):
+        self._paused_dest = None
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Could not delete %s: %s", path, e)
+        self.progress.set_fraction(0)
+        self.progress.set_text("")
 
     def finished(self, path, decrypted):
         what = "downloaded and decrypted" if decrypted else "downloaded"
