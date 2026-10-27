@@ -4,7 +4,7 @@ A GTK 3 window for **[frija-cli](https://github.com/Shantil-K/frija-cli)**, the 
 the interface. Looking up, downloading, verifying and decrypting firmware is all done
 by the `frija` package from frija-cli.
 
-![Frija GTK reading a phone in Auto mode](docs/screenshot.png)
+![Frija GTK downloading the latest firmware for a connected phone](docs/screenshot.png)
 
 It has the same **Auto / Manual / Legacy** tabs as the original Windows Frija:
 
